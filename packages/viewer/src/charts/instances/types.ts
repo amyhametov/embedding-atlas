@@ -24,6 +24,17 @@ export interface InstancesSpec {
   /** Optional custom SQL query to filter or transform the data */
   query?: string;
 
+  /**
+   * The column with pre-computed nearest neighbors, in the same format as the `neighbors` data column:
+   * `{ "ids": [id1, id2, ...], "distances": [d1, d2, ...] }` with `ids` sorted by distance.
+   * If specified, when a single point is selected in another view (e.g., by clicking it in the embedding view),
+   * this view shows the point followed by its nearest neighbors, closest first, instead of the regular list.
+   * The neighbors are limited to the current filter, and `sort` does not apply to them.
+   * Changing the filter afterwards (e.g., with a brush or lasso) or clearing the selection shows the regular list again.
+   * Ignored when `query` is specified.
+   */
+  neighbors?: string | null;
+
   /** Number of items per page, defaults to 100 */
   pageSize?: number;
 

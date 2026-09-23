@@ -22,6 +22,8 @@
     defaultColumnWidths: Record<string, number>;
     highlight: RowID[] | null;
     sort?: SortOrder;
+    /** Whether to show the sort buttons in the column headers, defaults to true. */
+    sortable?: boolean;
     onRowClick: (rowId: RowID | null | undefined, event: MouseEvent) => void;
     onSortChange: (sort: SortOrder | undefined) => void;
   }
@@ -35,6 +37,7 @@
     defaultColumnWidths,
     highlight,
     sort,
+    sortable = true,
     onRowClick,
     onSortChange,
   }: Props = $props();
@@ -127,28 +130,30 @@
         >
           <div class="flex gap-2 items-center">
             <div class="flex-1 truncate">{column}</div>
-            <button
-              onclick={() =>
-                changeColumnSortOrder(
-                  column,
-                  sortOrder == undefined ? "ascending" : sortOrder.order == "ascending" ? "descending" : undefined,
-                )}
-            >
-              <div
-                class:text-slate-300={!sortButtonHighlight}
-                class:dark:text-slate-600={!sortButtonHighlight}
-                class:text-slate-600={sortButtonHighlight}
-                class:dark:text-slate-200={sortButtonHighlight}
+            {#if sortable}
+              <button
+                onclick={() =>
+                  changeColumnSortOrder(
+                    column,
+                    sortOrder == undefined ? "ascending" : sortOrder.order == "ascending" ? "descending" : undefined,
+                  )}
               >
-                {#if sortOrder?.order == "ascending"}
-                  <IconSortUp />
-                {:else if sortOrder?.order == "descending"}
-                  <IconSortDown />
-                {:else}
-                  <IconSortUpDown />
-                {/if}
-              </div>
-            </button>
+                <div
+                  class:text-slate-300={!sortButtonHighlight}
+                  class:dark:text-slate-600={!sortButtonHighlight}
+                  class:text-slate-600={sortButtonHighlight}
+                  class:dark:text-slate-200={sortButtonHighlight}
+                >
+                  {#if sortOrder?.order == "ascending"}
+                    <IconSortUp />
+                  {:else if sortOrder?.order == "descending"}
+                    <IconSortDown />
+                  {:else}
+                    <IconSortUpDown />
+                  {/if}
+                </div>
+              </button>
+            {/if}
           </div>
           <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
           <div

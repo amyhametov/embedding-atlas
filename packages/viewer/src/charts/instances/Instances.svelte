@@ -11,10 +11,19 @@
   import SortOrderControl from "./SortOrderControl.svelte";
   import Table from "./Table.svelte";
 
-  import { IconCardView, IconRight, IconTableView } from "../../assets/icons.js";
+  import { IconCardView, IconClose, IconRight, IconTableView } from "../../assets/icons.js";
   import type { ColumnStyle } from "../../renderers/types.js";
+  import { predicateToString } from "../../utils/database.js";
   import { isolatedWritable } from "../../utils/store.js";
   import type { ChartViewProps, RowID } from "../chart.js";
+  import {
+    activeNeighborsAnchor,
+    isSameNeighborsTarget,
+    NEIGHBOR_RANK_COLUMN,
+    nearestNeighborsQuery,
+    neighborsTargetFromHighlight,
+    type NeighborsTarget,
+  } from "./neighbors.js";
   import { instancesQuery } from "./query.js";
   import type { InstancesSpec, InstancesState, SortOrder } from "./types.js";
 
@@ -38,6 +47,7 @@
   let isolatedHighlight = isolatedWritable(highlight);
 
   let viewMode = $derived((spec.viewMode ?? "table") as "table" | "cards");
+  let neighborsEnabled = $derived(spec.neighbors != null && spec.query == null);
   let offset = $derived(chartState.offset ?? 0);
   let pageSize = $derived(spec.pageSize ?? 50);
 
@@ -47,22 +57,50 @@
   // Column widths (local state, not persisted)
   let defaultColumnWidths = $state.raw<Record<string, number>>({});
 
+  // The point to show nearest neighbors for (see `spec.neighbors`), selected in another view.
+  let neighborsTarget = $state.raw<NeighborsTarget | null>(null);
+
+  // Returns true if the target changed.
+  function setNeighborsTarget(target: NeighborsTarget | null): boolean {
+    let current = untrack(() => neighborsTarget);
+    if (isSameNeighborsTarget(target, current)) {
+      return false;
+    }
+    neighborsTarget = target;
+    return true;
+  }
+
   // Subscribe to highlight changes
   $effect.pre(() => {
     let isOnMount = true;
     let previousValue: RowID[] | null = null;
     return isolatedHighlight.subscribe((v) => {
+      let target = neighborsTargetFromHighlight(v, predicateToString(context.filter.predicate(null)));
+      let neighborsTargetChanged = setNeighborsTarget(target);
       // Don't animate immediately on mount.
       if (isOnMount) {
         isOnMount = false;
         previousValue = v;
         return;
       }
-      // Animate when a single new point is added.
+      revealOnLoad = undefined;
       let newIDs = v ?? [];
       let oldIDs = previousValue ?? [];
       let enteringIDs = newIDs.filter((x) => oldIDs.indexOf(x) < 0);
-      if (enteringIDs.length == 1) {
+      // The list changes if it shows neighbors now, or will show them for the new target.
+      let listChanges =
+        neighborsTargetChanged &&
+        untrack(() => neighborsEnabled) &&
+        (target != null || untrack(() => data?.neighborsOf) != null);
+      if (listChanges) {
+        // The list changes to the new point and its neighbors (or back to the regular list), show it from the top.
+        resetOffset();
+        if (target == null && enteringIDs.length == 1) {
+          // E.g., Shift-click adds a second point: reveal it once the regular list is loaded.
+          revealOnLoad = enteringIDs[0];
+        }
+      } else if (enteringIDs.length == 1) {
+        // Animate when a single new point is added.
         animateToPoint(enteringIDs[0]);
       }
       previousValue = v;
@@ -73,6 +111,9 @@
     data: Record<string, any>[];
     columns: string[];
     offset: number;
+
+    /** The point whose nearest neighbors are shown, if any. */
+    neighborsOf?: RowID;
 
     offsetForId?: (id: RowID) => Promise<number | undefined>;
   }
@@ -101,30 +142,47 @@
 
   function createClients(options: {
     query?: string;
+    neighbors?: string | null;
     columns?: string[];
     columnStyles: Record<string, ColumnStyle>;
     sort?: SortOrder;
     pageSize: number;
   }) {
     let isOriginalTable = options.query == undefined;
-    let baseQuery = (predicate?: SQL.FilterExpr | null) =>
-      instancesQuery({ query: options.query, table: context.table, predicate: predicate });
+    // Nearest neighbors are only available for the original table.
+    let neighbors = isOriginalTable ? options.neighbors : null;
+    let currentNeighborsTarget = () => (neighbors != null ? neighborsTarget : null);
+    // The point to show neighbors for under the given predicate, or undefined to show all data.
+    let neighborsAnchor = (predicate?: SQL.FilterExpr | null): RowID | undefined =>
+      activeNeighborsAnchor(currentNeighborsTarget(), predicateToString(predicate ?? undefined));
+
+    let baseQuery = (predicate?: SQL.FilterExpr | null, anchor?: RowID) =>
+      neighbors != null && anchor !== undefined
+        ? nearestNeighborsQuery({ table: context.table, id: context.id, neighbors, anchor, predicate })
+        : instancesQuery({ query: options.query, table: context.table, predicate: predicate });
 
     // Build orderby expressions from sort specification
     let orderByExprs = (options.sort ?? []).map((s) => {
       let col = SQL.column(s.column);
       return s.direction === "descending" ? SQL.desc(col) : SQL.asc(col);
     });
+    // Neighbors are ordered by distance instead.
+    let orderBy = (anchor?: RowID) =>
+      anchor !== undefined ? [SQL.asc(SQL.column(NEIGHBOR_RANK_COLUMN))] : orderByExprs;
 
     let columnNames: string[] = [];
     let lastQueryOffset = 0;
     let lastQueryPredicate: SQL.FilterExpr | undefined = undefined;
+    let lastQueryAnchor: RowID | undefined = undefined;
+    let lastQueryNeighborsTarget = untrack(currentNeighborsTarget);
 
     let clientTotal = makeClient({
       coordinator: context.coordinator,
       selection: context.filter,
+      // The query depends on the neighbors target besides the filter, so don't use pre-aggregation.
+      filterStable: neighbors == null,
       query: (predicate) => {
-        return SQL.Query.from(baseQuery(predicate)).select({ count: SQL.count() });
+        return SQL.Query.from(baseQuery(predicate, neighborsAnchor(predicate))).select({ count: SQL.count() });
       },
       queryResult: (result: any) => {
         totalCount = result.get(0).count;
@@ -172,14 +230,16 @@
       query: (predicate) => {
         lastQueryOffset = offset;
         lastQueryPredicate = predicate;
-        return SQL.Query.from(baseQuery(predicate))
+        lastQueryNeighborsTarget = currentNeighborsTarget();
+        lastQueryAnchor = neighborsAnchor(predicate);
+        return SQL.Query.from(baseQuery(predicate, lastQueryAnchor))
           .select(
             Object.fromEntries([
               ...(isOriginalTable ? [["__id__", SQL.column(context.id)]] : []),
               ...columnNames.map((x) => [x, SQL.column(x)]),
             ]),
           )
-          .orderby(orderByExprs)
+          .orderby(orderBy(lastQueryAnchor))
           .limit(options.pageSize)
           .offset(offset);
       },
@@ -188,12 +248,14 @@
           data: result.toArray(),
           columns: columnNames,
           offset: lastQueryOffset,
+          neighborsOf: lastQueryAnchor,
           offsetForId: isOriginalTable
             ? async (id) => {
                 // Build ROW_NUMBER window function with same sort order as main query
-                let idOffset = SQL.Query.from(baseQuery(lastQueryPredicate)).select({
+                let order = orderBy(lastQueryAnchor);
+                let idOffset = SQL.Query.from(baseQuery(lastQueryPredicate, lastQueryAnchor)).select({
                   id: SQL.column(context.id),
-                  offset: orderByExprs.length > 0 ? SQL.row_number().orderby(...orderByExprs) : SQL.row_number(),
+                  offset: order.length > 0 ? SQL.row_number().orderby(...order) : SQL.row_number(),
                 });
                 let query = SQL.Query.from(idOffset)
                   .select({ offset: SQL.column("offset") })
@@ -207,8 +269,15 @@
     });
 
     $effect.pre(() => {
-      // When offset changes, rerun the query.
-      if (offset != lastQueryOffset) {
+      // Read both, so the effect reruns when either changes.
+      let currentOffset = offset;
+      let target = currentNeighborsTarget();
+      if (target !== lastQueryNeighborsTarget) {
+        // When the neighbors target changes, rerun both queries.
+        clientTotal.requestQuery();
+        client.requestQuery();
+      } else if (currentOffset != lastQueryOffset) {
+        // When offset changes, rerun the query.
         client.requestQuery();
       }
     });
@@ -223,6 +292,7 @@
   let clientsParams = $derived.by(
     deepMemo(() => ({
       query: spec.query,
+      neighbors: spec.neighbors,
       columns: spec.columns,
       columnStyles: columnStyles,
       sort: spec.sort,
@@ -303,6 +373,17 @@
     }
   });
 
+  // A point to reveal once the regular list is loaded (see the highlight subscription).
+  let revealOnLoad = $state.raw<RowID | undefined>(undefined);
+  $effect(() => {
+    let id = revealOnLoad;
+    if (id === undefined || data == null || data.neighborsOf != null) {
+      return;
+    }
+    revealOnLoad = undefined;
+    untrack(() => animateToPoint(id));
+  });
+
   function handlePageChange(page: number) {
     onStateChange((draft) => {
       draft.offset = page * pageSize;
@@ -337,6 +418,36 @@
         }
       }
     });
+    let selection = $highlight;
+    if (selection == null || selection.length == 0) {
+      // Clearing the selection shows the regular list again.
+      clearNeighbors();
+    } else if (data?.neighborsOf == null && !(selection.length == 1 && selection[0] === neighborsTarget?.id)) {
+      // The list shows other rows (e.g., within a brush) and stays as is, but the neighbors of
+      // a point that is no longer selected shouldn't come back when the filter changes back.
+      setNeighborsTarget(null);
+    }
+  }
+
+  function clearNeighbors() {
+    // Show the regular list from the top, if the list showed neighbors.
+    if (setNeighborsTarget(null) && data?.neighborsOf != null) {
+      resetOffset();
+    }
+  }
+
+  // A single selected point whose neighbors are not shown, e.g., after clicking its card. Tapping it on the
+  // map again does nothing (the selection doesn't change), so the header offers to show its neighbors.
+  let neighborsCandidate = $derived(
+    neighborsEnabled && $highlight != null && $highlight.length == 1 && $highlight[0] !== neighborsTarget?.id
+      ? $highlight[0]
+      : undefined,
+  );
+
+  function showNeighborsOf(id: RowID) {
+    if (setNeighborsTarget({ id: id, predicate: predicateToString(context.filter.predicate(null)) })) {
+      resetOffset();
+    }
   }
 </script>
 
@@ -358,13 +469,38 @@
         ]}
       />
       <PaginatorControls currentPage={currentPage} pageCount={pageCount} onChange={handlePageChange} />
-      <SortOrderControl
-        value={spec.sort}
-        onChange={(value) =>
-          onSpecChange((draft) => {
-            draft.sort = value;
-          })}
-      />
+      {#if data?.neighborsOf != null}
+        <!-- The whole chip clears the selection: an easy target on touch screens. -->
+        <button
+          class="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 px-2 py-1 rounded-md text-slate-500 dark:text-slate-400 select-none"
+          title="Clear selection"
+          onclick={() => {
+            clearNeighbors();
+            highlight.set(null);
+          }}
+        >
+          Neighbors of #{data.neighborsOf}
+          <IconClose />
+        </button>
+      {:else}
+        <SortOrderControl
+          value={spec.sort}
+          onChange={(value) =>
+            onSpecChange((draft) => {
+              draft.sort = value;
+            })}
+        />
+      {/if}
+      {#if neighborsCandidate !== undefined}
+        {@const id = neighborsCandidate}
+        <button
+          class="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 px-2 py-1 rounded-md text-slate-500 dark:text-slate-400 select-none"
+          title="Show the nearest neighbors of the selected point"
+          onclick={() => showNeighborsOf(id)}
+        >
+          Show neighbors of #{id}
+        </button>
+      {/if}
     </div>
   </div>
 
@@ -381,6 +517,7 @@
           defaultColumnWidths={defaultColumnWidths}
           highlight={$highlight}
           sort={spec.sort}
+          sortable={data.neighborsOf == null}
           onRowClick={handleRowClick}
           onSortChange={(value) =>
             onSpecChange((draft) => {
