@@ -345,7 +345,7 @@
   style:height={`${height ?? spec.defaultHeight ?? 500}px`}
 >
   <div class="flex items-center justify-between p-2 border-b border-slate-200 dark:border-slate-700 gap-4">
-    <div class="flex items-center gap-4 flex-shrink-0">
+    <div class="flex flex-wrap items-center gap-x-4 gap-y-2 min-w-0">
       <SegmentedControl
         value={viewMode}
         onChange={(v) =>
